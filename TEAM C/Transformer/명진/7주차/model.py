@@ -1,0 +1,177 @@
+import torch
+import torch.nn as nn
+import math
+
+## Input Embedding / 입력 문장 -> 512차원의 vector
+class InputEmbeddings(nn.Module):
+
+    def __init__(self, d_model: int, vocab_size: int) -> None:
+        super().__init__()
+        self.d_model = d_model # dimension
+        self.vocab_size = vocab_size # vocabulary 단어 개수
+        self.embedding = nn.Embedding(vocab_size, d_model)
+
+    def forward(self, x):
+        # (batch, seq_len) --> (batch, seq_len, d_model)
+        # 논문에서 설명한 weights 곱해줌
+        return self.embedding(x) * math.sqrt(self.d_model) 
+
+## Positional Encoding / Information about the position of each word inside the sentence
+    # 엠베딩과 같은 사이즈의 벡터(512)    
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, seq_len: int, dropout: float) -> None:
+        super().__init__()
+        self.d_model = d_model # 512 벡터 사이즈
+        self.seq_len = seq_len # 문장의 maximun len
+        self.dropout = nn.Dropout(dropout)
+        
+        # matrix of shape (seq_len, d_model) 문장의 단어 수*벡터사이즈
+        pe = torch.zeros(seq_len, d_model)
+        # Vector (seq_len, 1) 생성
+        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)) # (d_model / 2)
+        
+        # 짝수 position에 sine 적용
+        # sin(position * (10000 ** (2i / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term) 
+        
+        # 홀수 position에 cosine 적용
+        # cos(position * (10000 ** (2i / d_model))
+        pe[:, 1::2] = torch.cos(position * div_term) 
+        
+        
+        # batch dimension / 배치에 있는 모든 문장에 적용
+        pe = pe.unsqueeze(0) # (1(배치 차원), seq_len, d_model)
+        # Register the positional encoding as a buffer, 모델에 함께 저장
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False) 
+        # 이 텐서는 학습하는 동안 변하지 않는 값이므로 false
+        # (batch, seq_len, d_model)
+        return self.dropout(x)
+
+
+## Feed Forward /  Fully Connected layer
+class FeedForwardBlock(nn.Module):
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
+        super().__init__()
+        self.linear_1 = nn.Linear(d_model, d_ff) # w1 and b1
+        # (batch, seq_len, d_model) -> (batch, seq_len, d_ff)
+        self.dropout = nn.Dropout(dropout)
+        self.linear_2 = nn.Linear(d_ff, d_model) # w2 and b2
+        # (batch, seq_len, d_ff) -> (batch, seq_len, d_model)
+
+    def forward(self, x):
+        return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
+
+class MultiHeadAttentionBlock(nn.Module):
+
+    def __init__(self, d_model: int, h: int, dropout: float) -> None:
+        super().__init__()
+        self.d_model = d_model # Embedding vector size(512)
+        self.h = h # Number of heads, d_model이 h로 나누어떨어질 수 있어야함
+        assert d_model % h == 0, "d_model is not divisible by h"
+
+        self.d_k = d_model // h # 각 head의 Dimension of vector
+        self.w_q = nn.Linear(d_model, d_model, bias=False) # Wq / (d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model, bias=False) # Wk
+        self.w_v = nn.Linear(d_model, d_model, bias=False) # Wv 모두 같은 값 
+        
+        self.w_o = nn.Linear(d_model, d_model, bias=False) # Wo / (h*dv, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    # attention 계산하는 메서드
+    @staticmethod #instance없이 .으로 호출 가능
+    def attention(query, key, value, mask, dropout: nn.Dropout):
+        d_k = query.shape[-1]
+        # 논문 수식 구현
+        # (batch, h, seq_len, d_k) --> (batch, h, seq_len, seq_len)
+        attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
+        if mask is not None:
+            # 매우 낮은값으로 replace (indicating -inf) -> softmax지나서 0됨
+            attention_scores.masked_fill_(mask == 0, -1e9)
+        attention_scores = attention_scores.softmax(dim=-1) # (batch, h, seq_len, seq_len) # Apply softmax
+        if dropout is not None:
+            attention_scores = dropout(attention_scores)
+        # (batch, h, seq_len, seq_len) --> (batch, h, seq_len, d_k)
+        # return tuple, for visualization
+        return (attention_scores @ value), attention_scores
+    
+    # Forward
+    def forward(self, q, k, v, mask): 
+        query = self.w_q(q) # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
+        key = self.w_k(k) # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
+        value = self.w_v(v) # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
+
+        # 더 작은 metrics로 분리하여 각 head에 할당
+        # 문장이 아니라 엠베딩을 split하고싶은 것 -> batch dimension([0])은 keep
+        # 두번째 dimensiond인 sequence도 split하지x -> keep([1])
+        # (batch, seq_len, d_model) -> (batch, seq_len, h, d_k) -> (batch, h, seq_len, d_k)
+        # transpose: 각 head에서 seq_len, d_k 볼 수 있도록(full sentence) 
+        query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
+        key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
+        value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
+
+        # attention 메서드 이용해서 계산
+        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
+        
+        # Combine all the heads
+        # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
+        x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
+
+        # Multiply by Wo
+        # (batch, seq_len, d_model) --> (batch, seq_len, d_model)  
+        return self.w_o(x)
+    
+## layer normalization 
+class LayerNormalization(nn.Module):
+
+    def __init__(self, features: int, eps:float=10**-6) -> None:
+        super().__init__()
+        self.eps = eps # numerical stability 위함 / sigma값이 0에 가까워져서 분모가 0 되는걸 막기위해 + epsilon해줌
+        self.alpha = nn.Parameter(torch.ones(features)) #will be multiplied / nn.: makes the parameter learnable
+        self.bias = nn.Parameter(torch.zeros(features)) # will be added
+
+    def forward(self, x):
+        # x: (batch, seq_len, hidden_size)
+         # Keep the dimension for broadcasting
+        mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
+        # Keep the dimension for broadcasting
+        std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
+        # 논문상의 수식 구현
+        return self.alpha * (x - mean) / (std + self.eps) + self.bias
+
+## skip connection부분
+class ResidualConnection(nn.Module):
+    
+        def __init__(self, features: int, dropout: float) -> None:
+            super().__init__()
+            self.dropout = nn.Dropout(dropout)
+            self.norm = LayerNormalization(features)
+    
+        def forward(self, x, sublayer): #sublayer: output of the next layer
+            return x + self.dropout(sublayer(self.norm(x)))
+        #논문상에선sublayer 다음에 normalization 적용
+
+
+# decoder 지나서 linear layer, (seq,d_model) embedding을 다시 position of the vocabulary 
+class ProjectionLayer(nn.Module):
+
+    def __init__(self, d_model, vocab_size) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, vocab_size) # d_model -> vocab_size
+
+    def forward(self, x) -> None:
+        # (batch, seq_len, d_model) --> (batch, seq_len, vocab_size)
+        return torch.log_softmax(self.proj(x), dim=-1) # self.proj(x)
+
+
+
+
+
+
+
+
