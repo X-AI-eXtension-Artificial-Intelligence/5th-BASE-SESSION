@@ -1,4 +1,4 @@
-
+  
 class PositionalEncoding(nn.Module):
     """
     compute sinusoid encoding.
